@@ -1,36 +1,76 @@
+import sys
+from pathlib import Path
+
+# Add the root directory (claritas-agent/) to the Python path
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.append(str(BASE_DIR))
+
 import json
 from langchain.tools import Tool
-from pathlib import Path
-import pandas as pd
 from services.llm import invoke_model
-import sqlite3
-import os
+import pymysql
+import pandas as pd
+from datetime import date, datetime
+import decimal
 
-# --- read data ---
-#db_path = "claritas.db"
-base_path = Path(__file__).resolve().parent.parent
-db_path = base_path / 'data' / 'claritas.db'
-csv_dir = base_path / 'data'
+# --- MySQL connection config ---
+MYSQL_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "Bageljuice2001?!@",
+    "database": "claritas_v2"
+}
 
-conn = sqlite3.connect(db_path)
+# ----------------------------
+# MySQL Utilities
+# ----------------------------
+def convert_mysql_result(row):
+    return {
+        k: (
+            v.isoformat() if isinstance(v, (date, datetime)) else
+            float(v) if isinstance(v, decimal.Decimal) else
+            v
+        )
+        for k, v in row.items()
+    }
 
-# Files: name as {table}.csv
-for file in os.listdir(csv_dir):
-    if file.endswith(".csv"):
-        table_name = os.path.splitext(file)[0]
-        df = pd.read_csv(os.path.join(csv_dir, file))
-        df.to_sql(table_name, conn, if_exists="replace", index=False)
-        print(f"Loaded table: {table_name}")
+def run_mysql_query(query):
+    print(f"🔧 Running SQL against MySQL...")
+    conn = pymysql.connect(
+        host=MYSQL_CONFIG["host"],
+        user=MYSQL_CONFIG["user"],
+        password=MYSQL_CONFIG["password"],
+        database=MYSQL_CONFIG["database"],
+        cursorclass=pymysql.cursors.DictCursor
+    )
+    with conn.cursor() as cursor:
+        cursor.execute(query)
+        results = [convert_mysql_result(row) for row in cursor.fetchall()]
+    conn.close()
+    print(f"✅ Retrieved {len(results)} rows\n")
+    return results
 
-conn.close()
+# ----------------------------
+# Format schema for LLM prompt
+# ----------------------------
+def format_schema_for_prompt():
+    schema_path = BASE_DIR / "data" / "database_schema.json"
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema_dict = json.load(f)
 
+    lines = []
+    for table, columns in schema_dict.items():
+        lines.append(f"Table: {table}")
+        for col in columns:
+            lines.append(f"  - {col['column']} {col['type']}")
+        lines.append("")
+    return "\n".join(lines)
 
-
-# Generate SQL code using prompt and schema
+# ----------------------------
+# Claude SQL Generation
+# ----------------------------
 def get_sql_from_prompt(prompt, schema):
-
-    #format the prompt that will be sent when calling the LLM
-    #importance in structuring well to ensure we get favoravle results
     formatted_prompt = f"""
     \n\nHuman: You are a SQL expert. Given the following database schema and user request, generate the best SQL query to answer the question.
 
@@ -40,66 +80,83 @@ def get_sql_from_prompt(prompt, schema):
     USER REQUEST:
     {prompt}
 
-    Respond with ONLY the SQL query and nothing else. Do not include explanations or formatting.
 
-    IMPORTANT RULES:
-    When using hitcount data, the action types are the following (case sensitive):
-        - lead
-        - signup
-        - registration
-        - install
+Respond with ONLY the raw SQL query and nothing else. Do NOT wrap it in markdown, triple backticks, or provide any commentary. Just output valid SQL syntax as it would be executed directly in MySQL.
 
-    NOTES:
-        - In the pred_actual_data_combined table, values that are labeled as actual are past data points that are used to train the predicted data (future)
+IMPORTANT RULES:
+- Use the `pixel_hist` table to get hitcount data broken down by date, action, dma, prectived_or_actual, and top_level_domain. prectived_or_actual represents whether the data is 'predicted' or 'actual'.
+- NOTE: The column for actual vs predicted labels is named `prectived_or_actual` (note the typo) in the `pixel_hist` table. Use it as-is when querying.
+- Use the `prizm_to_dma` table to match DMAs with PRIZM segments. Join on `pixel_hist.dma = prizm_to_dma.DMA_CODE`.
+- Use the `prizm_info` table to describe PRIZM segments. Join on `prizm_to_dma.PRIZM_Segment = prizm_info.PRIZM_Segment`.
+- When aggregating (e.g., SUM(hitcount)), use GROUP BY to group by the appropriate dimension (e.g., PRIZM_Segment, DMA_Name).
+- Always ensure SELECT, FROM, JOIN, WHERE, and GROUP BY clauses are used correctly and formatted cleanly.
+- Never include triple backticks (```), the word "sql", or any markdown formatting.
+- In the `pixel_hist` table, values labeled as actual or predicted are stored in the `predicted_or_actual` column.
+- To check whether a row is actual or predicted, always use a LIKE filter with wildcards to handle whitespace:
+    - For actual values: `WHERE predicted_or_actual LIKE "%actual%"`
+    - For predicted values: `WHERE predicted_or_actual LIKE "%predicted%"`
+- The most recent day with actual readings is `2025-02-28`. Treat this as "today" when interpreting questions about "next week", "next month", or future forecasts.
+FILTERING INSTRUCTIONS:
+- If the user references an organization like "RedCrossBlood.org", filter using:
+    `pixel_hist.top_level_domain LIKE '%RedCrossBlood.org%'`
+- If the user references a geographic region like "New York", filter using:
+    `prizm_to_dma.DMA_Name LIKE '%New York%'`
 
-    \n\nAssistant:
+MAPPING NOTES:
+- The `action` column in the `pixel_hist` table contains the following case-sensitive values:
+    - 'lead'
+    - 'signup'
+    - 'registration'
+    - 'install'
+    - 'purchase'
+    - 'homepage'
+
+- If the user mentions:
+    - "registration", "voter registration", or "campaign signups" → use `action = 'registration'`
+    - "signup" → use `action = 'signup'`
+    - "lead generation" or "leads" → use `action = 'lead'`
+    - "installs" → use `action = 'install'`
+    - "purchases" → use `action = 'purchase'`
+    - "homepage traffic", "site visits", or "landing page" → use `action = 'homepage'`
+
+- Always use `pixel_hist.action` to filter for interaction types. Ensure the value matches one of the valid case-sensitive options above.
+- Prefer fully qualified column names (e.g., `pixel_hist.date`) rather than table aliases.
+
+\n\nAssistant:
     """
-    #message list format to allow for multi-turn conversations (not sure if this is in the right place)
     messages = [{"role": "user", "content": formatted_prompt}]
-
-    #prep request body for bedrock (select claude, max_tokens, and formatted chat version)
-    body={
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 250,
-            "messages": messages
-        }
-
-    #model type (via claude)
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 2000,
+        "messages": messages
+    }
     modelId = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
-
-    #ensure content type
-    accept = "application/json"
-    contentType = "application/json"
-
-    #send the formatted response to the LLM
-    response = invoke_model(body, modelId, accept, contentType)
-
-    #extract raw response body and parse from JSON
+    response = invoke_model(body, modelId, "application/json", "application/json")
     response_body = json.loads(response.get("body").read())
+    return response_body["content"][0]["text"].strip()
 
-    #pull actual SQL string generated
-    sql_query = response_body["content"][0]["text"].strip()
-    return sql_query
-
-def get_query(prompt, schema):
-
+# ----------------------------
+# LangChain Tool Wrapper
+# ----------------------------
+def get_query(prompt):
+    schema = format_schema_for_prompt()
     sql_query = get_sql_from_prompt(prompt, schema)
-
-    #connect to local SQLlite database with path
-    conn = sqlite3.connect(db_path)
     try:
-        #send query to database and retrieve set, load to pandas df
-        df = pd.read_sql_query(sql_query, conn)
-        return df
+        result = run_mysql_query(sql_query)
+        return pd.DataFrame(result)
     except Exception as e:
-        print("SQL execution error:", e)
+        print("❌ SQL execution error:", e)
         return None
-    finally:
-        conn.close()
 
-def create_query_tool(schema):
+def create_query_tool(schema=None):  # schema arg not used now
     return Tool(
         name="query_tool",
-        func=lambda user_prompt: get_query(user_prompt, schema),
-        description="Use this tool to query database using a natural language prompt."
+        func=lambda user_prompt: get_query(user_prompt),
+        description="Use this tool to query the MySQL database using a natural language prompt."
+                "Use this tool to query the MySQL database for any questions involving web hitcount activity across all domains and DMA codes. "
+        "This includes actual historical data or predicted future trends, segmented by action types such as 'lead', 'signup', 'registration', 'purchase', etc. "
+        "Use this tool for analyzing patterns related to PRIZM segments, domains, digital campaigns, and geographic locations. "
+        "It should be used whenever the user prompt references specific websites, DMA regions, PRIZM behaviors, or phrases like "
+        "'next week', 'next month', 'predictions', 'trends', or 'actual vs predicted'. "
+        "This is the primary tool for answering all questions grounded in the structured database schema."
     )
