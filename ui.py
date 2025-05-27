@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 import pandas as pd
 import re
-from streamlit_mic_recorder import speech_to_text  # New import
+from streamlit_mic_recorder import speech_to_text  # Voice input
+import asyncio
+import edge_tts  # Text-to-speech
 
 # --- Load schema ---
 base_path = Path(__file__).resolve().parent
@@ -15,96 +17,149 @@ with schema_path.open('r', encoding='utf-8') as f:
 # --- Setup agent ---
 agent_executor, memory = setup_agent(database_schema)
 
+# --- Text-to-Speech Function ---
+def speak(text):
+    async def run():
+        communicate = edge_tts.Communicate(text, voice="en-US-AriaNeural")
+        await communicate.save("output.mp3")
+    asyncio.run(run())
+    st.audio("output.mp3", format="audio/mp3")
+
 # --- Export Conversation Function ---
 def export_conversation():
     conversation_data = []
-
     for i, (speaker, msg) in enumerate(st.session_state.chat_history):
         if speaker == "User":
-            conversation_data.append({
-                "speaker": speaker,
-                "message": msg,
-                "feedback": "NA"
-            })
+            conversation_data.append({"speaker": speaker, "message": msg, "feedback": "NA"})
         elif speaker == "Agent":
-            feedback_entry = next(
-                (entry for entry in st.session_state.feedback_log if entry["agent_response"] == msg),
-                None
-            )
+            feedback_entry = next((entry for entry in st.session_state.feedback_log if entry["agent_response"] == msg), None)
             feedback = feedback_entry["feedback"] if feedback_entry else "No Feedback"
-            conversation_data.append({
-                "speaker": speaker,
-                "message": msg,
-                "feedback": feedback
-            })
-
-    df = pd.DataFrame(conversation_data)
-    return df
+            conversation_data.append({"speaker": speaker, "message": msg, "feedback": feedback})
+    return pd.DataFrame(conversation_data)
 
 # --- Main UI ---
 def run_ui():
-    st.set_page_config(page_title="PRIZM Agent Chat", layout="centered")
-    st.title("Chat Agent")
+    st.set_page_config(page_title="PRIZM Agent Chat", layout="wide")
+
+    st.markdown("""
+        <style>
+        body {
+            background-color: #fdf6e3;
+            color: #002b36;
+        }
+        .stApp {
+            background-color: #fdf6e3;
+            color: #002b36;
+        }
+        .stButton > button {
+            background-color: #002b36;
+            color: #fdf6e3;
+            border: none;
+            padding: 0.5em 1em;
+            border-radius: 6px;
+            font-weight: bold;
+            transition: 0.3s;
+        }
+        .stButton > button:hover {
+            background-color: #014f86;
+            color: white;
+            cursor: pointer;
+        }
+        textarea, input {
+            color: #002b36 !important;
+            background-color: #fefcf5 !important;
+        }
+        div.stRadio label {
+            color: #1E3A8A !important;
+            font-size: 18px !important;
+            font-weight: 500 !important;
+        }
+        div[role="radiogroup"] label span {
+            color: #1E3A8A !important;
+            font-size: 18px !important;
+            font-weight: 600 !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<h1 style='color:#002b36;'>Ask Clarix Anything!</h1>", unsafe_allow_html=True)
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
-
     if "feedback_log" not in st.session_state:
         st.session_state.feedback_log = []
-
     if "conversation_ended" not in st.session_state:
         st.session_state.conversation_ended = False
+    if "tts_enabled" not in st.session_state:
+        st.session_state.tts_enabled = True
 
-    st.subheader("Choose input mode")
-    input_mode = st.radio("Input mode:", ["Text", "Voice"], horizontal=True)
+    st.session_state.tts_enabled = st.checkbox("🔈 Enable Text-to-Speech", value=st.session_state.tts_enabled)
 
-    if input_mode == "Text":
-        user_input = st.chat_input("Ask the agent something...")
-    else:
-        user_input = speech_to_text(
-            language='en',
-            start_prompt="🎤 Start Recording",
-            stop_prompt="🛑 Stop Recording",
-            just_once=True,
-            use_container_width=True,
-            key='voice_input'
-        )
+    left_col, right_col = st.columns([3, 2])
+
+    with left_col:
+        icon_path = Path(__file__).resolve().parent / "agent_icon.png"
+        st.image(str(icon_path), width=250)
+
+        input_mode = st.radio("Choose input mode", ["Text", "Voice"])
+        user_input = ""
+
+        if input_mode == "Text":
+            user_input = st.chat_input("Ask the agent something...")
+        else:
+            user_input = speech_to_text(
+                language='en',
+                start_prompt="🎤 Start Recording",
+                stop_prompt="🛑 Stop Recording",
+                just_once=True,
+                use_container_width=True,
+                key='voice_input'
+            )
+            if user_input:
+                st.write(f"📝 Transcribed: {user_input}")
+
         if user_input:
-            st.write(f"📝 Transcribed: {user_input}")
+            response = agent_executor.invoke({"input": user_input})
+            st.session_state.chat_history.append(("User", user_input))
+            st.session_state.chat_history.append(("Agent", response["output"]))
+            if st.session_state.tts_enabled:
+                speak(response["output"])
 
-    if user_input:
-        response = agent_executor.invoke({"input": user_input})
-        st.session_state.chat_history.append(("User", user_input))
-        st.session_state.chat_history.append(("Agent", response["output"]))
+    with right_col:
+        st.markdown("### Your Chat with Clarix")
+        name_map = {"User": "You", "Agent": "Clarix"}
 
-    for i, (speaker, msg) in enumerate(st.session_state.chat_history):
-        with st.chat_message(speaker):
-            if isinstance(msg, str) and msg.startswith("![Time Series]("):
-                match = re.search(r"base64,([A-Za-z0-9+/=]+)", msg)
-                if match:
-                    st.image(f"data:image/png;base64,{match.group(1)}")
-                else:
-                    st.markdown(msg)
-            else:
-                st.markdown(msg)
+        for i, (speaker, msg) in enumerate(st.session_state.chat_history):
+            display_name = name_map.get(speaker, speaker)
+            align = "right" if speaker == "User" else "left"
+            bubble_color = "#f0f0f0" if speaker == "User" else "#e7f4f9"
+            text_color = "#002b36"
+
+            st.markdown(f"""
+                <div style="text-align: {align};">
+                    <div style="
+                        display: inline-block;
+                        background-color: {bubble_color};
+                        padding: 12px;
+                        border-radius: 10px;
+                        margin-bottom: 10px;
+                        max-width: 80%;
+                        text-align: left;
+                    ">
+                        <strong style="color: {text_color};">{display_name}:</strong><br>{msg}
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
 
             if speaker == "Agent" and i == len(st.session_state.chat_history) - 1 and not st.session_state.conversation_ended:
-                col1, col2, _ = st.columns([1, 1, 6])
+                col1, col2, _ = st.columns([2, 2, 6])
                 with col1:
                     if st.button("👍", key=f"thumbs_up_{i}"):
-                        st.session_state.feedback_log.append({
-                            "user_input": st.session_state.chat_history[i-1][1],
-                            "agent_response": msg,
-                            "feedback": "thumbs_up"
-                        })
+                        st.session_state.feedback_log.append({"user_input": st.session_state.chat_history[i-1][1], "agent_response": msg, "feedback": "thumbs_up"})
                         st.success("Thanks for the thumbs up!")
                 with col2:
                     if st.button("👎", key=f"thumbs_down_{i}"):
-                        st.session_state.feedback_log.append({
-                            "user_input": st.session_state.chat_history[i-1][1],
-                            "agent_response": msg,
-                            "feedback": "thumbs_down"
-                        })
+                        st.session_state.feedback_log.append({"user_input": st.session_state.chat_history[i-1][1], "agent_response": msg, "feedback": "thumbs_down"})
                         st.success("Thanks for the feedback!")
 
     if not st.session_state.conversation_ended:
@@ -114,11 +169,6 @@ def run_ui():
     if st.session_state.conversation_ended:
         df = export_conversation()
         csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download Conversation CSV",
-            data=csv,
-            file_name="conversation_log.csv",
-            mime="text/csv",
-        )
+        st.download_button("Download Conversation CSV", csv, "conversation_log.csv", "text/csv")
         st.success("Conversation ended! Download your chat log above.")
         st.stop()
