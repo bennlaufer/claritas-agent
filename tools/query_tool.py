@@ -18,7 +18,6 @@ import decimal
 MYSQL_CONFIG = {
     "host": "localhost",
     "user": "root",
-    "password": "",
     "database": "claritas_v2"
 }
 
